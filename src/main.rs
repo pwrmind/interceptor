@@ -37,7 +37,8 @@ fn main() -> Result<()> {
     };
 
     println!("[+] Ready. Commands:");
-    println!("      find <pattern>              - search exported functions");
+    println!("      find <pattern>              - search exported function names");
+    println!("      scan [-a|-w|-x] [-i] <pat>  - scan all process memory");
     println!("      break <func> [enter|exit]   - set breakpoint (repeatable)");
     println!("      break <func> exit <spec>    - exit BP with dump spec");
     println!("      run | continue              - resume execution");
@@ -52,15 +53,18 @@ fn main() -> Result<()> {
     println!("      hwlist | hwclear            - manage HW BPs");
     println!("      quit                        - exit");
     println!();
+    println!("  scan flags:");
+    println!("      -a  ASCII + UTF-16LE (both)");
+    println!("      -w  UTF-16LE only");
+    println!("      -x  hex bytes (e.g. '70 61 73 73' or '0x70,0x61')");
+    println!("      -i  case-insensitive (ASCII only)");
+    println!("      examples: scan password   scan -a salt   scan -x DE AD BE EF");
+    println!();
     println!("  Dump spec syntax:");
     println!("      <addr>:<len>                - one spec, use ',' for multiple");
     println!("      <addr> = [esp+N] | eax | ebx | ecx | edx | esi | edi");
     println!("      <len>  = [esp+N] | [[esp+N]] | eax..edi | <N> | str | wstr | auto");
-    println!("      Examples:");
-    println!("        break CryptDecrypt exit [esp+20]:[[esp+24]]");
-    println!("        break Send exit [esp+8]:[esp+12]");
-    println!("        break recv exit [esp+8]:eax");
-    println!("        break MessageBoxW exit [esp+8]:wstr");
+    println!("      e.g. break CryptDecrypt exit [esp+20]:[[esp+24]]");
 
     loop {
         print!("dbg> ");
@@ -83,6 +87,10 @@ fn main() -> Result<()> {
                     dbg.find(tokens[1]);
                 }
                 Ok(())
+            }
+            "scan" | "search" | "mem" => {
+                let args = &tokens[1..];
+                dbg.scan(args)
             }
             "break" | "b" => {
                 if tokens.len() < 2 {

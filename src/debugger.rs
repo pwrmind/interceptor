@@ -12,7 +12,10 @@ use windows_sys::Win32::System::Diagnostics::Debug::{
     CONTEXT, CREATE_PROCESS_DEBUG_EVENT, CREATE_THREAD_DEBUG_EVENT, DEBUG_EVENT,
     EXIT_PROCESS_DEBUG_EVENT, LOAD_DLL_DEBUG_EVENT,
 };
-use windows_sys::Win32::System::Memory::{VirtualProtectEx, PAGE_EXECUTE_READWRITE};
+use windows_sys::Win32::System::Memory::{
+    VirtualProtectEx, VirtualQueryEx, MEMORY_BASIC_INFORMATION, MEM_COMMIT,
+    PAGE_EXECUTE_READWRITE, PAGE_GUARD, PAGE_NOACCESS,
+};
 use windows_sys::Win32::System::Threading::{
     CreateProcessW, GetCurrentProcess, OpenProcess, OpenProcessToken, OpenThread,
     CREATE_NEW_CONSOLE, DEBUG_ONLY_THIS_PROCESS, PROCESS_ALL_ACCESS, PROCESS_INFORMATION,
@@ -44,6 +47,10 @@ const THREAD_SUSPEND_RESUME: u32 = 0x0002;
 const EFLAGS_TF: u32 = 0x100;
 
 const SAVED_STACK_DWORDS: usize = 16;
+
+const SCAN_MAX_RESULTS: usize = 100;
+const SCAN_MAX_HITS_PER_REGION: usize = 32;
+const SCAN_CHUNK: u32 = 64 * 1024;
 
 // ---------------------------------------------------------------------------
 // Dump spec types
@@ -464,6 +471,31 @@ fn enable_debug_privilege() -> Result<()> {
     Ok(())
 }
 
+fn utf16le(s: &str) -> Vec<u8> {
+    s.encode_utf16().flat_map(|c| c.to_le_bytes()).collect()
+}
+
+fn parse_hex_bytes(s: &str) -> Result<Vec<u8>> {
+    let cleaned: String = s
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != ',' && *c != '-')
+        .collect();
+    let s = cleaned.as_str();
+    let s = s
+        .strip_prefix("0x")
+        .or_else(|| s.strip_prefix("0X"))
+        .unwrap_or(s);
+    if s.len() % 2 != 0 {
+        bail!("hex string must have even length (got {})", s.len());
+    }
+    let mut out = Vec::with_capacity(s.len() / 2);
+    for i in (0..s.len()).step_by(2) {
+        let byte = u8::from_str_radix(&s[i..i + 2], 16)?;
+        out.push(byte);
+    }
+    Ok(out)
+}
+
 impl Debugger {
     pub fn launch(target: &str) -> Result<Self> {
         let mut cmdline: Vec<u16> = target.encode_utf16().chain(std::iter::once(0)).collect();
@@ -703,6 +735,224 @@ impl Debugger {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Memory scan
+    // -----------------------------------------------------------------------
+
+    pub fn scan(&mut self, args: &[&str]) -> Result<()> {
+        if self.exited {
+            println!("[!] Process has exited.");
+            return Ok(());
+        }
+
+        let mut wide_only = false;
+        let mut hex_mode = false;
+        let mut case_insensitive = false;
+        let mut all_types = false;
+        let mut pattern_parts: Vec<&str> = Vec::new();
+
+        for a in args {
+            match *a {
+                "-w" | "--wide" => wide_only = true,
+                "-x" | "--hex" => hex_mode = true,
+                "-i" | "--icase" => case_insensitive = true,
+                "-a" | "--all" => all_types = true,
+                "-h" | "--help" => {
+                    println!("Usage: scan [-a|-w|-x] [-i] <pattern>");
+                    println!("  -a  ASCII + UTF-16LE");
+                    println!("  -w  UTF-16LE only");
+                    println!("  -x  hex bytes ('70 61 73 73' or '0x70,0x61')");
+                    println!("  -i  case-insensitive (ASCII only)");
+                    return Ok(());
+                }
+                s if s.starts_with('-') && s.len() > 1 => {
+                    println!("[!] Unknown flag: {}", s);
+                    return Ok(());
+                }
+                _ => pattern_parts.push(*a),
+            }
+        }
+
+        let pattern = pattern_parts.join(" ");
+        if pattern.is_empty() {
+            println!("Usage: scan [-a|-w|-x] [-i] <pattern>");
+            return Ok(());
+        }
+
+        let mut needles: Vec<(Vec<u8>, &'static str)> = Vec::new();
+        if hex_mode {
+            match parse_hex_bytes(&pattern) {
+                Ok(b) if !b.is_empty() => needles.push((b, "hex")),
+                Ok(_) => {
+                    println!("[!] Empty hex pattern");
+                    return Ok(());
+                }
+                Err(e) => {
+                    println!("[!] Bad hex: {}", e);
+                    return Ok(());
+                }
+            }
+        } else if wide_only {
+            needles.push((utf16le(&pattern), "wide"));
+        } else if all_types {
+            needles.push((pattern.as_bytes().to_vec(), "ascii"));
+            needles.push((utf16le(&pattern), "wide"));
+        } else {
+            needles.push((pattern.as_bytes().to_vec(), "ascii"));
+        }
+
+        let max_needle = needles.iter().map(|(n, _)| n.len()).max().unwrap_or(1);
+        let overlap = (max_needle.saturating_sub(1)) as u32;
+
+        let regions = self.enumerate_regions()?;
+        let total_bytes: u64 = regions.iter().map(|(_, s)| *s as u64).sum();
+        println!(
+            "[+] Scanning {} region(s), {:.1} MB",
+            regions.len(),
+            total_bytes as f64 / 1_048_576.0
+        );
+
+        let mut count = 0usize;
+        let mut regions_scanned = 0usize;
+
+        'outer: for (base, size) in regions {
+            if size == 0 {
+                continue;
+            }
+            regions_scanned += 1;
+            let mut addr = base;
+            let end = base.wrapping_add(size);
+
+            'region: while addr < end {
+                let to_read = ((end - addr).min(SCAN_CHUNK)) as usize;
+                let buf = match read_memory(self.process_handle, addr, to_read) {
+                    Ok(b) if !b.is_empty() => b,
+                    _ => {
+                        addr = addr.wrapping_add(SCAN_CHUNK);
+                        continue;
+                    }
+                };
+
+                let mut hits_here = 0usize;
+                for (needle, label) in &needles {
+                    if needle.len() > buf.len() {
+                        continue;
+                    }
+                    let mut pos = 0usize;
+                    let end_pos = buf.len() - needle.len();
+                    while pos <= end_pos {
+                        let matched = if case_insensitive && *label == "ascii" {
+                            buf[pos..pos + needle.len()]
+                                .iter()
+                                .zip(needle.iter())
+                                .all(|(a, b)| a.to_ascii_lowercase() == b.to_ascii_lowercase())
+                        } else {
+                            &buf[pos..pos + needle.len()] == needle.as_slice()
+                        };
+                        if matched {
+                            let hit_addr = addr.wrapping_add(pos as u32);
+                            let module = self.annotate_module(hit_addr);
+                            match module {
+                                Some(m) => println!(
+                                    "\n  [{}] 0x{:08X}  ({})",
+                                    label, hit_addr, m
+                                ),
+                                None => println!("\n  [{}] 0x{:08X}", label, hit_addr),
+                            }
+                            let ctx_start = hit_addr.saturating_sub(16) & !0xFu32;
+                            let ctx_len = 80usize;
+                            if let Ok(ctx) = read_memory(self.process_handle, ctx_start, ctx_len) {
+                                hex_dump(ctx_start, &ctx);
+                            }
+                            count += 1;
+                            hits_here += 1;
+                            if count >= SCAN_MAX_RESULTS {
+                                println!(
+                                    "[!] Reached {} results; stopping.",
+                                    SCAN_MAX_RESULTS
+                                );
+                                break 'outer;
+                            }
+                            if hits_here >= SCAN_MAX_HITS_PER_REGION {
+                                println!("  [!] Too many hits in this region, skipping rest.");
+                                break 'region;
+                            }
+                            pos += needle.len().max(1);
+                        } else {
+                            pos += 1;
+                        }
+                    }
+                }
+
+                let step = (SCAN_CHUNK - overlap).max(1);
+                addr = addr.wrapping_add(step);
+            }
+        }
+
+        if count == 0 {
+            println!("  (no matches)");
+        } else {
+            println!(
+                "\n[+] {} match(es) in {} region(s) scanned",
+                count, regions_scanned
+            );
+        }
+        Ok(())
+    }
+
+    fn enumerate_regions(&self) -> Result<Vec<(u32, u32)>> {
+        let mut regions = Vec::new();
+        let mut addr: usize = 0;
+        let mbi_size = std::mem::size_of::<MEMORY_BASIC_INFORMATION>();
+        loop {
+            let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            let ret = unsafe {
+                VirtualQueryEx(
+                    self.process_handle,
+                    addr as *const _,
+                    &mut mbi,
+                    mbi_size,
+                )
+            };
+            if ret == 0 {
+                break;
+            }
+            let region_base = mbi.BaseAddress as usize;
+            let region_size = mbi.RegionSize;
+            if region_size == 0 {
+                break;
+            }
+            if mbi.State == MEM_COMMIT
+                && (mbi.Protect & PAGE_GUARD) == 0
+                && (mbi.Protect & PAGE_NOACCESS) == 0
+            {
+                regions.push((region_base as u32, region_size as u32));
+            }
+            let next = region_base.saturating_add(region_size);
+            if next <= addr {
+                break;
+            }
+            addr = next;
+            if addr >= 0x8000_0000 {
+                break;
+            }
+        }
+        Ok(regions)
+    }
+
+    fn annotate_module(&self, addr: u32) -> Option<String> {
+        for (name, m) in &self.modules {
+            if addr >= m.base && addr < m.base.wrapping_add(m.size) {
+                return Some(name.clone());
+            }
+        }
+        None
+    }
+
+    // -----------------------------------------------------------------------
+    // Breakpoints
+    // -----------------------------------------------------------------------
+
     pub fn set_breakpoint(&mut self, name: &str, mode: &str, spec_str: &str) -> Result<()> {
         let bp_type = if mode.eq_ignore_ascii_case("exit") {
             BpType::Exit
@@ -799,7 +1049,12 @@ impl Debugger {
             spec_label,
             module
         );
-        if bp_type == BpType::Exit && self.breakpoints.get(&addr).map_or(false, |b| b.exit_specs.is_empty()) {
+        if bp_type == BpType::Exit
+            && self
+                .breakpoints
+                .get(&addr)
+                .map_or(false, |b| b.exit_specs.is_empty())
+        {
             println!("[*] No dump spec — will show raw args + tip on return.");
         }
         Ok(())
@@ -1056,7 +1311,10 @@ impl Debugger {
                     }
                     self.clear_trap_flag(ev.dwThreadId)?;
                     if stop {
-                        println!("\n[+] step done. EIP=0x{:08X}", self.eip(ev.dwThreadId)?);
+                        println!(
+                            "\n[+] step done. EIP=0x{:08X}",
+                            self.eip(ev.dwThreadId)?
+                        );
                         self.paused = Some(Paused {
                             event: ev,
                             resume: ResumeAction::Continue,
@@ -1283,7 +1541,6 @@ impl Debugger {
 
         let esp = ctx.Esp;
 
-        // Snapshot of stack: [esp+0] = return addr, [esp+4..] = args and beyond.
         let ret_addr = read_u32(self.process_handle, esp)?;
         let mut saved_stack: Vec<u32> = Vec::with_capacity(SAVED_STACK_DWORDS);
         saved_stack.push(ret_addr);
@@ -1293,7 +1550,6 @@ impl Debugger {
             saved_stack.push(v);
         }
 
-        // Install temp BP on return address.
         let ret_orig = read_memory(self.process_handle, ret_addr, 1)?[0];
         write_memory(self.process_handle, ret_addr, &[0xCC])?;
         self.temp_breakpoints.insert(
@@ -1309,7 +1565,6 @@ impl Debugger {
             },
         );
 
-        // Restore original byte at function entry.
         write_memory(self.process_handle, bp_addr, &[orig_byte])?;
         ctx.Eip = bp_addr;
         self.set_context(tid, ctx)?;
@@ -1331,14 +1586,16 @@ impl Debugger {
             println!("    (no dump spec; will show args + tip on return)");
             println!("    tip: 'break <func> exit [esp+20]:[[esp+24]]' etc.");
         } else {
-            println!("    --- planned dumps (resolved on entry) ---");
+            println!("    --- planned dumps ---");
             for spec in &specs {
                 match &spec.addr {
                     AddrSource::Stack(off) => {
                         let idx = (*off / 4) as usize;
                         match saved_stack.get(idx) {
                             Some(&a) => println!("    {}: addr=0x{:08X}", spec.label(), a),
-                            None => println!("    {}: (stack offset out of range)", spec.label()),
+                            None => {
+                                println!("    {}: (stack offset out of range)", spec.label())
+                            }
                         }
                     }
                     AddrSource::Register(r) => {
