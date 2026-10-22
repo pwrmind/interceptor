@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Result};
 use std::collections::HashMap;
 
 use windows_sys::Win32::Foundation::{CloseHandle, FALSE, HANDLE, LUID};
@@ -30,9 +30,7 @@ const INFINITE: u32 = 0xFFFF_FFFF;
 const DBG_CONTINUE: i32 = 0x0001_0002;
 const DBG_EXCEPTION_NOT_HANDLED: i32 = 0x8001_0001u32 as i32;
 
-// EXCEPTION_DEBUG_EVENT is defined locally (windows-sys import omitted to avoid name clash)
 const EXCEPTION_DEBUG_EVENT: u32 = 1;
-
 const EXCEPTION_BREAKPOINT: i32 = 0x8000_0003u32 as i32;
 const EXCEPTION_SINGLE_STEP: i32 = 0x8000_0004u32 as i32;
 
@@ -44,6 +42,204 @@ const CONTEXT_DEBUG_REGISTERS: u32 = CONTEXT_I386 | 0x0000_0010;
 const THREAD_SUSPEND_RESUME: u32 = 0x0002;
 
 const EFLAGS_TF: u32 = 0x100;
+
+const SAVED_STACK_DWORDS: usize = 16;
+
+// ---------------------------------------------------------------------------
+// Dump spec types
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug)]
+pub struct DumpSpec {
+    addr: AddrSource,
+    len: LenSource,
+}
+
+#[derive(Clone, Debug)]
+enum AddrSource {
+    Stack(u32),
+    Register(Reg),
+}
+
+#[derive(Clone, Debug)]
+enum LenSource {
+    StackDirect(u32),
+    StackPtr(u32),
+    Register(Reg),
+    Fixed(u32),
+    CString,
+    WString,
+    Auto,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Reg {
+    Eax,
+    Ebx,
+    Ecx,
+    Edx,
+    Esi,
+    Edi,
+    Ebp,
+    Esp,
+}
+
+impl Reg {
+    fn from_name(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "eax" => Some(Reg::Eax),
+            "ebx" => Some(Reg::Ebx),
+            "ecx" => Some(Reg::Ecx),
+            "edx" => Some(Reg::Edx),
+            "esi" => Some(Reg::Esi),
+            "edi" => Some(Reg::Edi),
+            "ebp" => Some(Reg::Ebp),
+            "esp" => Some(Reg::Esp),
+            _ => None,
+        }
+    }
+    fn value(self, ctx: &CONTEXT) -> u32 {
+        match self {
+            Reg::Eax => ctx.Eax,
+            Reg::Ebx => ctx.Ebx,
+            Reg::Ecx => ctx.Ecx,
+            Reg::Edx => ctx.Edx,
+            Reg::Esi => ctx.Esi,
+            Reg::Edi => ctx.Edi,
+            Reg::Ebp => ctx.Ebp,
+            Reg::Esp => ctx.Esp,
+        }
+    }
+    fn name(self) -> &'static str {
+        match self {
+            Reg::Eax => "eax",
+            Reg::Ebx => "ebx",
+            Reg::Ecx => "ecx",
+            Reg::Edx => "edx",
+            Reg::Esi => "esi",
+            Reg::Edi => "edi",
+            Reg::Ebp => "ebp",
+            Reg::Esp => "esp",
+        }
+    }
+}
+
+fn parse_u32_any(s: &str) -> Option<u32> {
+    let s = s.trim();
+    if let Some(h) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        u32::from_str_radix(h, 16).ok()
+    } else {
+        s.parse::<u32>().ok()
+    }
+}
+
+fn parse_addr_source(s: &str) -> Result<AddrSource> {
+    let s = s.trim();
+    if let Some(inner) = s.strip_prefix('[').and_then(|x| x.strip_suffix(']')) {
+        if let Some(rest) = inner.strip_prefix("esp+") {
+            if let Some(n) = parse_u32_any(rest) {
+                return Ok(AddrSource::Stack(n));
+            }
+        }
+        bail!("Unsupported address expression: {}", s);
+    }
+    if let Some(r) = Reg::from_name(s) {
+        return Ok(AddrSource::Register(r));
+    }
+    bail!("Unsupported address expression: {}", s);
+}
+
+fn parse_len_source(s: &str) -> Result<LenSource> {
+    let s = s.trim();
+    if s == "str" {
+        return Ok(LenSource::CString);
+    }
+    if s == "wstr" {
+        return Ok(LenSource::WString);
+    }
+    if s == "auto" || s.is_empty() {
+        return Ok(LenSource::Auto);
+    }
+    if let Some(inner) = s.strip_prefix("[[").and_then(|x| x.strip_suffix("]]")) {
+        if let Some(rest) = inner.strip_prefix("esp+") {
+            if let Some(n) = parse_u32_any(rest) {
+                return Ok(LenSource::StackPtr(n));
+            }
+        }
+        bail!("Unsupported length expression: {}", s);
+    }
+    if let Some(inner) = s.strip_prefix('[').and_then(|x| x.strip_suffix(']')) {
+        if let Some(rest) = inner.strip_prefix("esp+") {
+            if let Some(n) = parse_u32_any(rest) {
+                return Ok(LenSource::StackDirect(n));
+            }
+        }
+        bail!("Unsupported length expression: {}", s);
+    }
+    if let Some(n) = parse_u32_any(s) {
+        return Ok(LenSource::Fixed(n));
+    }
+    if let Some(r) = Reg::from_name(s) {
+        return Ok(LenSource::Register(r));
+    }
+    bail!("Unsupported length expression: {}", s);
+}
+
+fn parse_dump_spec(s: &str) -> Result<DumpSpec> {
+    let mut depth = 0;
+    let mut split_pos = None;
+    for (i, ch) in s.char_indices() {
+        match ch {
+            '[' => depth += 1,
+            ']' => depth -= 1,
+            ':' if depth == 0 => {
+                split_pos = Some(i);
+                break;
+            }
+            _ => {}
+        }
+    }
+    let (addr_s, len_s) = match split_pos {
+        Some(i) => (&s[..i], &s[i + 1..]),
+        None => (s, ""),
+    };
+    let addr = parse_addr_source(addr_s)?;
+    let len = parse_len_source(len_s)?;
+    Ok(DumpSpec { addr, len })
+}
+
+fn parse_dump_specs(s: &str) -> Result<Vec<DumpSpec>> {
+    if s.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    s.split(',')
+        .filter(|p| !p.trim().is_empty())
+        .map(|p| parse_dump_spec(p.trim()))
+        .collect()
+}
+
+impl DumpSpec {
+    fn label(&self) -> String {
+        let a = match &self.addr {
+            AddrSource::Stack(off) => format!("[esp+{}]", off),
+            AddrSource::Register(r) => r.name().to_string(),
+        };
+        let l = match &self.len {
+            LenSource::StackDirect(off) => format!("[esp+{}]", off),
+            LenSource::StackPtr(off) => format!("[[esp+{}]]", off),
+            LenSource::Register(r) => r.name().to_string(),
+            LenSource::Fixed(n) => format!("{}", n),
+            LenSource::CString => "str".to_string(),
+            LenSource::WString => "wstr".to_string(),
+            LenSource::Auto => "auto".to_string(),
+        };
+        format!("{}:{}", a, l)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Debugger state
+// ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum BpType {
@@ -69,6 +265,7 @@ struct Breakpoint {
     bp_type: BpType,
     function_name: String,
     armed: bool,
+    exit_specs: Vec<DumpSpec>,
 }
 
 struct TempBreakpoint {
@@ -78,9 +275,9 @@ struct TempBreakpoint {
 
 struct ExitContext {
     function_name: String,
-    pb_data_addr: u32,
-    pdw_data_len_addr: u32,
     entry_addr: u32,
+    saved_stack: Vec<u32>,
+    specs: Vec<DumpSpec>,
 }
 
 struct ModuleInfo {
@@ -121,7 +318,7 @@ pub struct Debugger {
     process_id: u32,
     breakpoints: HashMap<u32, Breakpoint>,
     temp_breakpoints: HashMap<u32, TempBreakpoint>,
-    pending_breakpoints: Vec<(String, BpType)>,
+    pending_breakpoints: Vec<(String, BpType, Vec<DumpSpec>)>,
     modules: HashMap<String, ModuleInfo>,
     cached_functions: HashMap<String, FunctionInfo>,
     hw_breakpoints: Vec<HwBreakpoint>,
@@ -290,7 +487,10 @@ impl Debugger {
             )
         };
         if ok == 0 {
-            bail!("CreateProcessW failed: {}", std::io::Error::last_os_error());
+            bail!(
+                "CreateProcessW failed: {}",
+                std::io::Error::last_os_error()
+            );
         }
 
         if !pi.hThread.is_null() {
@@ -385,10 +585,6 @@ impl Debugger {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // User commands — resume / step
-    // -----------------------------------------------------------------------
-
     pub fn run(&mut self) -> Result<()> {
         if self.exited {
             println!("[!] Process has exited.");
@@ -479,10 +675,6 @@ impl Debugger {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // Trap flag helpers
-    // -----------------------------------------------------------------------
-
     fn set_trap_flag(&self, tid: u32) -> Result<()> {
         let mut ctx = self.get_context(tid, CONTEXT_CONTROL | CONTEXT_INTEGER)?;
         ctx.EFlags |= EFLAGS_TF;
@@ -494,10 +686,6 @@ impl Debugger {
         ctx.EFlags &= !EFLAGS_TF;
         self.set_context(tid, &ctx)
     }
-
-    // -----------------------------------------------------------------------
-    // find / break / dump / disas / info
-    // -----------------------------------------------------------------------
 
     pub fn find(&self, pattern: &str) {
         let pat = pattern.to_lowercase();
@@ -515,29 +703,45 @@ impl Debugger {
         }
     }
 
-    pub fn set_breakpoint(&mut self, name: &str, mode: &str) -> Result<()> {
+    pub fn set_breakpoint(&mut self, name: &str, mode: &str, spec_str: &str) -> Result<()> {
         let bp_type = if mode.eq_ignore_ascii_case("exit") {
             BpType::Exit
         } else {
             BpType::Enter
         };
+        let specs = if bp_type == BpType::Exit {
+            parse_dump_specs(spec_str)?
+        } else {
+            if !spec_str.trim().is_empty() {
+                println!("[!] Spec is only applicable to 'exit' mode; ignored.");
+            }
+            Vec::new()
+        };
+
         let key = name.to_lowercase();
         if let Some(fi) = self.cached_functions.get(&key) {
             let fname = fi.name.clone();
             let addr = fi.address;
             let module = fi.module.clone();
-            self.install_bp(&fname, addr, bp_type, &module)
+            self.install_bp(&fname, addr, bp_type, &module, specs)
         } else {
             println!(
                 "[*] '{}' not loaded yet; queued as pending breakpoint.",
                 name
             );
-            self.pending_breakpoints.push((name.to_string(), bp_type));
+            self.pending_breakpoints.push((name.to_string(), bp_type, specs));
             Ok(())
         }
     }
 
-    fn install_bp(&mut self, name: &str, addr: u32, bp_type: BpType, module: &str) -> Result<()> {
+    fn install_bp(
+        &mut self,
+        name: &str,
+        addr: u32,
+        bp_type: BpType,
+        module: &str,
+        exit_specs: Vec<DumpSpec>,
+    ) -> Result<()> {
         if let Some(bp) = self.breakpoints.get_mut(&addr) {
             if bp.armed {
                 println!("[!] Breakpoint already installed at 0x{:08X}", addr);
@@ -546,6 +750,7 @@ impl Debugger {
             write_memory(self.process_handle, addr, &[0xCC])?;
             bp.armed = true;
             bp.bp_type = bp_type;
+            bp.exit_specs = exit_specs;
             println!(
                 "[+] Re-armed BP at 0x{:08X} [{}]",
                 addr,
@@ -558,6 +763,20 @@ impl Debugger {
         }
         let orig = read_memory(self.process_handle, addr, 1)?[0];
         write_memory(self.process_handle, addr, &[0xCC])?;
+
+        let spec_label = if exit_specs.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " spec={}",
+                exit_specs
+                    .iter()
+                    .map(|s| s.label())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+        };
+
         self.breakpoints.insert(
             addr,
             Breakpoint {
@@ -565,18 +784,24 @@ impl Debugger {
                 bp_type,
                 function_name: name.to_string(),
                 armed: true,
+                exit_specs,
             },
         );
+
         println!(
-            "[+] Breakpoint: {} (0x{:08X}) [{}] in {}",
+            "[+] Breakpoint: {} (0x{:08X}) [{}{}] in {}",
             name,
             addr,
             match bp_type {
                 BpType::Enter => "enter",
                 BpType::Exit => "exit",
             },
+            spec_label,
             module
         );
+        if bp_type == BpType::Exit && self.breakpoints.get(&addr).map_or(false, |b| b.exit_specs.is_empty()) {
+            println!("[*] No dump spec — will show raw args + tip on return.");
+        }
         Ok(())
     }
 
@@ -663,10 +888,6 @@ impl Debugger {
         println!("  {} export(s)", matches.len());
     }
 
-    // -----------------------------------------------------------------------
-    // Registers / backtrace
-    // -----------------------------------------------------------------------
-
     pub fn regs(&self) {
         let tid = match &self.paused {
             Some(p) => p.event.dwThreadId,
@@ -720,10 +941,6 @@ impl Debugger {
             ebp = next_ebp;
         }
     }
-
-    // -----------------------------------------------------------------------
-    // Hardware breakpoints
-    // -----------------------------------------------------------------------
 
     pub fn add_hw_breakpoint(&mut self, addr: u32, kind: &str) -> Result<()> {
         let hw_kind = match kind.to_lowercase().as_str() {
@@ -817,10 +1034,6 @@ impl Debugger {
 
         self.set_context(tid, &ctx)
     }
-
-    // -----------------------------------------------------------------------
-    // Event handling
-    // -----------------------------------------------------------------------
 
     fn handle_event(&mut self, ev: DEBUG_EVENT, init_phase: bool) -> Result<Flow> {
         if ev.dwDebugEventCode == EXCEPTION_DEBUG_EVENT {
@@ -916,7 +1129,6 @@ impl Debugger {
             }
 
             CREATE_THREAD_DEBUG_EVENT => {
-                // CREATE_THREAD_DEBUG_INFO has no dwThreadId; use ev.dwThreadId.
                 let tid = ev.dwThreadId;
                 if !self.hw_breakpoints.is_empty() {
                     if let Err(e) = self.apply_hw_breakpoints_to_thread(tid) {
@@ -975,17 +1187,17 @@ impl Debugger {
 
     fn try_resolve_pending(&mut self) {
         let pending = std::mem::take(&mut self.pending_breakpoints);
-        for (name, bt) in pending {
+        for (name, bt, specs) in pending {
             let key = name.to_lowercase();
             if let Some(fi) = self.cached_functions.get(&key) {
                 let fname = fi.name.clone();
                 let addr = fi.address;
                 let module = fi.module.clone();
-                if let Err(e) = self.install_bp(&fname, addr, bt, &module) {
+                if let Err(e) = self.install_bp(&fname, addr, bt, &module, specs) {
                     println!("[!] Failed to install pending bp {}: {}", fname, e);
                 }
             } else {
-                self.pending_breakpoints.push((name, bt));
+                self.pending_breakpoints.push((name, bt, specs));
             }
         }
     }
@@ -995,10 +1207,6 @@ impl Debugger {
         let nt = base.wrapping_add(e_lfanew);
         read_u32(self.process_handle, nt.wrapping_add(0x50))
     }
-
-    // -----------------------------------------------------------------------
-    // Breakpoint handling
-    // -----------------------------------------------------------------------
 
     fn handle_breakpoint(&mut self, ev: DEBUG_EVENT) -> Result<Flow> {
         let exc = unsafe { &ev.u.Exception };
@@ -1063,17 +1271,29 @@ impl Debugger {
         tid: u32,
         ctx: &mut CONTEXT,
     ) -> Result<()> {
-        let (orig_byte, fname) = {
+        let (orig_byte, fname, specs) = {
             let bp = self.breakpoints.get_mut(&bp_addr).unwrap();
             bp.armed = false;
-            (bp.original_byte, bp.function_name.clone())
+            (
+                bp.original_byte,
+                bp.function_name.clone(),
+                bp.exit_specs.clone(),
+            )
         };
 
         let esp = ctx.Esp;
-        let ret_addr = read_u32(self.process_handle, esp)?;
-        let pb_data_addr = read_u32(self.process_handle, esp.wrapping_add(20))?;
-        let pdw_data_len_addr = read_u32(self.process_handle, esp.wrapping_add(24))?;
 
+        // Snapshot of stack: [esp+0] = return addr, [esp+4..] = args and beyond.
+        let ret_addr = read_u32(self.process_handle, esp)?;
+        let mut saved_stack: Vec<u32> = Vec::with_capacity(SAVED_STACK_DWORDS);
+        saved_stack.push(ret_addr);
+        for i in 1..SAVED_STACK_DWORDS {
+            let v = read_u32(self.process_handle, esp.wrapping_add((i * 4) as u32))
+                .unwrap_or(0);
+            saved_stack.push(v);
+        }
+
+        // Install temp BP on return address.
         let ret_orig = read_memory(self.process_handle, ret_addr, 1)?[0];
         write_memory(self.process_handle, ret_addr, &[0xCC])?;
         self.temp_breakpoints.insert(
@@ -1082,13 +1302,14 @@ impl Debugger {
                 original_byte: ret_orig,
                 exit_ctx: ExitContext {
                     function_name: fname.clone(),
-                    pb_data_addr,
-                    pdw_data_len_addr,
                     entry_addr: bp_addr,
+                    saved_stack: saved_stack.clone(),
+                    specs: specs.clone(),
                 },
             },
         );
 
+        // Restore original byte at function entry.
         write_memory(self.process_handle, bp_addr, &[orig_byte])?;
         ctx.Eip = bp_addr;
         self.set_context(tid, ctx)?;
@@ -1098,8 +1319,34 @@ impl Debugger {
             fname, bp_addr
         );
         println!("    return addr : 0x{:08X}", ret_addr);
-        println!("    pbData      : 0x{:08X}", pb_data_addr);
-        println!("    pdwDataLen  : 0x{:08X}", pdw_data_len_addr);
+        println!("    entry ESP   : 0x{:08X}", esp);
+        println!("    --- args ---");
+        for i in 0..8 {
+            let idx = i + 1;
+            if let Some(&v) = saved_stack.get(idx) {
+                println!("    arg[{}] [esp+{}] = 0x{:08X}", i, 4 + i * 4, v);
+            }
+        }
+        if specs.is_empty() {
+            println!("    (no dump spec; will show args + tip on return)");
+            println!("    tip: 'break <func> exit [esp+20]:[[esp+24]]' etc.");
+        } else {
+            println!("    --- planned dumps (resolved on entry) ---");
+            for spec in &specs {
+                match &spec.addr {
+                    AddrSource::Stack(off) => {
+                        let idx = (*off / 4) as usize;
+                        match saved_stack.get(idx) {
+                            Some(&a) => println!("    {}: addr=0x{:08X}", spec.label(), a),
+                            None => println!("    {}: (stack offset out of range)", spec.label()),
+                        }
+                    }
+                    AddrSource::Register(r) => {
+                        println!("    {}: (addr from {} at exit)", spec.label(), r.name())
+                    }
+                }
+            }
+        }
         println!("    (type 'continue' to run to function return)");
         self.disassemble(bp_addr, 8);
 
@@ -1137,26 +1384,17 @@ impl Debugger {
         );
         println!("    EAX = 0x{:08X} ({})", ret_val, ret_val as i32);
 
-        if ret_val != 0 {
-            let len = read_u32(self.process_handle, tb.exit_ctx.pdw_data_len_addr)?;
-            println!("    decrypted length: {} bytes", len);
-            if len > 0 && (len as usize) <= (1usize << 20) {
-                match read_memory(self.process_handle, tb.exit_ctx.pb_data_addr, len as usize) {
-                    Ok(data) => {
-                        println!(
-                            "    decrypted bytes at 0x{:08X}:",
-                            tb.exit_ctx.pb_data_addr
-                        );
-                        hex_dump(tb.exit_ctx.pb_data_addr, &data);
-                    }
-                    Err(e) => println!("[!] reading decrypted buffer failed: {}", e),
+        if tb.exit_ctx.specs.is_empty() {
+            self.dump_default_return(&tb.exit_ctx);
+        } else {
+            for spec in &tb.exit_ctx.specs {
+                if let Err(e) = self.dump_with_spec(&tb.exit_ctx, spec, ctx) {
+                    println!("    [!] dump spec {} failed: {}", spec.label(), e);
                 }
             }
-        } else {
-            println!("    function returned FALSE (0)");
         }
-        println!("   (type 'continue' to resume target)");
 
+        println!("   (type 'continue' to resume target)");
         self.paused = Some(Paused {
             event: ev,
             resume: ResumeAction::Continue,
@@ -1164,9 +1402,129 @@ impl Debugger {
         Ok(())
     }
 
-    // -----------------------------------------------------------------------
-    // Thread context helpers
-    // -----------------------------------------------------------------------
+    fn dump_default_return(&self, ec: &ExitContext) {
+        println!("    --- args ---");
+        for i in 0..8 {
+            let idx = i + 1;
+            if let Some(&v) = ec.saved_stack.get(idx) {
+                println!("    arg[{}] = 0x{:08X}", i, v);
+            }
+        }
+        println!(
+            "    tip: use 'break <func> exit [esp+N]:[[esp+M]]' to dump a specific buffer"
+        );
+    }
+
+    fn dump_with_spec(
+        &self,
+        ec: &ExitContext,
+        spec: &DumpSpec,
+        ctx: &CONTEXT,
+    ) -> Result<()> {
+        let addr = match &spec.addr {
+            AddrSource::Stack(off) => {
+                let idx = (*off / 4) as usize;
+                ec.saved_stack
+                    .get(idx)
+                    .copied()
+                    .ok_or_else(|| anyhow!("stack offset 0x{:X} out of captured range", off))?
+            }
+            AddrSource::Register(r) => r.value(ctx),
+        };
+
+        println!("    --- dump {} @ 0x{:08X} ---", spec.label(), addr);
+
+        match &spec.len {
+            LenSource::Fixed(n) => {
+                let n = (*n).min(1 << 20) as usize;
+                if n == 0 {
+                    println!("    (len=0)");
+                    return Ok(());
+                }
+                let data = read_memory(self.process_handle, addr, n)?;
+                hex_dump(addr, &data);
+            }
+            LenSource::StackDirect(off) => {
+                let idx = (*off / 4) as usize;
+                let n = ec
+                    .saved_stack
+                    .get(idx)
+                    .copied()
+                    .ok_or_else(|| anyhow!("stack offset 0x{:X} out of captured range", off))?;
+                let n = n.min(1 << 20) as usize;
+                if n == 0 {
+                    println!("    (len=0)");
+                    return Ok(());
+                }
+                let data = read_memory(self.process_handle, addr, n)?;
+                hex_dump(addr, &data);
+            }
+            LenSource::StackPtr(off) => {
+                let idx = (*off / 4) as usize;
+                let ptr = ec
+                    .saved_stack
+                    .get(idx)
+                    .copied()
+                    .ok_or_else(|| anyhow!("stack offset 0x{:X} out of captured range", off))?;
+                let n = read_u32(self.process_handle, ptr)?;
+                let n = n.min(1 << 20) as usize;
+                if n == 0 {
+                    println!("    (len=0)");
+                    return Ok(());
+                }
+                let data = read_memory(self.process_handle, addr, n)?;
+                hex_dump(addr, &data);
+            }
+            LenSource::Register(r) => {
+                let n = r.value(ctx).min(1 << 20) as usize;
+                if n == 0 {
+                    println!("    (len=0)");
+                    return Ok(());
+                }
+                let data = read_memory(self.process_handle, addr, n)?;
+                hex_dump(addr, &data);
+            }
+            LenSource::CString => {
+                let data = self.read_cstring(addr, 4096)?;
+                hex_dump(addr, &data);
+            }
+            LenSource::WString => {
+                let data = self.read_wstring(addr, 4096)?;
+                hex_dump(addr, &data);
+            }
+            LenSource::Auto => {
+                if let Ok(data) = self.read_cstring(addr, 256) {
+                    if !data.is_empty() {
+                        hex_dump(addr, &data);
+                        return Ok(());
+                    }
+                }
+                match read_memory(self.process_handle, addr, 64) {
+                    Ok(data) => hex_dump(addr, &data),
+                    Err(e) => println!("    [!] read failed: {}", e),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn read_cstring(&self, addr: u32, max: usize) -> Result<Vec<u8>> {
+        let data = read_memory(self.process_handle, addr, max)?;
+        let end = data.iter().position(|&b| b == 0).unwrap_or(data.len());
+        Ok(data[..end].to_vec())
+    }
+
+    fn read_wstring(&self, addr: u32, max: usize) -> Result<Vec<u8>> {
+        let data = read_memory(self.process_handle, addr, max * 2)?;
+        let mut end = data.len();
+        for i in (0..data.len().saturating_sub(1)).step_by(2) {
+            if data[i] == 0 && data[i + 1] == 0 {
+                end = i + 2;
+                break;
+            }
+        }
+        Ok(data[..end].to_vec())
+    }
 
     fn get_context(&self, tid: u32, flags: u32) -> Result<CONTEXT> {
         let h = self.open_thread(tid)?;

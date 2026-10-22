@@ -39,6 +39,7 @@ fn main() -> Result<()> {
     println!("[+] Ready. Commands:");
     println!("      find <pattern>              - search exported functions");
     println!("      break <func> [enter|exit]   - set breakpoint (repeatable)");
+    println!("      break <func> exit <spec>    - exit BP with dump spec");
     println!("      run | continue              - resume execution");
     println!("      step | s                    - single step");
     println!("      regs | reg                  - dump registers");
@@ -50,6 +51,16 @@ fn main() -> Result<()> {
     println!("      hwbreak <hexaddr> <kind>    - HW BP (kind: exec|write|read)");
     println!("      hwlist | hwclear            - manage HW BPs");
     println!("      quit                        - exit");
+    println!();
+    println!("  Dump spec syntax:");
+    println!("      <addr>:<len>                - one spec, use ',' for multiple");
+    println!("      <addr> = [esp+N] | eax | ebx | ecx | edx | esi | edi");
+    println!("      <len>  = [esp+N] | [[esp+N]] | eax..edi | <N> | str | wstr | auto");
+    println!("      Examples:");
+    println!("        break CryptDecrypt exit [esp+20]:[[esp+24]]");
+    println!("        break Send exit [esp+8]:[esp+12]");
+    println!("        break recv exit [esp+8]:eax");
+    println!("        break MessageBoxW exit [esp+8]:wstr");
 
     loop {
         print!("dbg> ");
@@ -75,11 +86,12 @@ fn main() -> Result<()> {
             }
             "break" | "b" => {
                 if tokens.len() < 2 {
-                    println!("Usage: break <func> [enter|exit]");
+                    println!("Usage: break <func> [enter|exit] [spec]");
                     Ok(())
                 } else {
                     let mode = if tokens.len() > 2 { tokens[2] } else { "enter" };
-                    dbg.set_breakpoint(tokens[1], mode)
+                    let spec = if tokens.len() > 3 { tokens[3..].join(" ") } else { String::new() };
+                    dbg.set_breakpoint(tokens[1], mode, &spec)
                 }
             }
             "dump" | "d" => {
