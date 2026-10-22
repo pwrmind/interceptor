@@ -89,7 +89,6 @@ pub fn parse_exports_from_memory(process: HANDLE, base: u32) -> Result<Vec<Expor
         };
         let func_addr = base.wrapping_add(func_rva);
 
-        // Forwarded export (RVA указывает внутрь export directory) — пропускаем.
         if func_addr >= base.wrapping_add(export_rva) && func_addr < export_dir_end {
             continue;
         }

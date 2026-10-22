@@ -22,3 +22,22 @@ pub fn hex_dump(start: u32, bytes: &[u8]) {
     }
     println!();
 }
+
+/// Печатает несколько диапазонов, разделяя их маркерами недоступных участков.
+pub fn hex_dump_chunks(chunks: &[(u32, Vec<u8>)]) {
+    if chunks.is_empty() {
+        println!("  (no readable data)");
+        return;
+    }
+    let mut prev_end: Option<u32> = None;
+    for (addr, bytes) in chunks {
+        if let Some(pe) = prev_end {
+            if *addr > pe {
+                println!("  --- unmapped/inaccessible: 0x{:08X}..0x{:08X} ({} bytes) ---",
+                         pe, addr, addr.wrapping_sub(pe));
+            }
+        }
+        hex_dump(*addr, bytes);
+        prev_end = Some(addr.wrapping_add(bytes.len() as u32));
+    }
+}
